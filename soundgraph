@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+
+import sys
+import csv
+import wave
+import time
+import math
+import numbers
+import argparse
+
+def wordify(word, from_unit=False):
+  word_as_int = int(word * (1 << 15)) if from_unit else int(word)
+  if not (-(1 << 16) <= word_as_int < (1 << 16)):
+    return False
+  word_is_negative = word_as_int < 0
+  word_as_int += 1 << 16
+  high_byte = (word_as_int >> 8) & ((1 << 8) - 1)
+  low_byte = word_as_int & ((1 << 8) - 1)
+  return bytes((low_byte, high_byte))
+
+def all_but_first(xs):
+  xs_iter = iter(xs)
+  for x in xs_iter:
+    break
+  yield from xs_iter
+
+def all_but_first_n(xs, n=1):
+  xs_iter = iter(xs)
+  for x in zip(range(n), xs_iter):
+    pass
+  yield from xs_iter
+
+def all_but_last(xs):
+  xs_iter = iter(xs)
+  last = next(xs_iter)
+  for x in xs_iter:
+    yield last
+    last = x
+
+def all_but_last_n(xs, n=1):
+  xs_iter = iter(xs)
+  space = [None] * n
+  for i, x in zip(range(n), xs_iter):
+    space[i] = x
+  for i, x in enumerate(xs_iter):
+    j = i % n
+    yield space[j]
+    space[j] = x
+
+def cutoff(x, **kwargs):
+  low = kwargs['low'] if 'low' in kwargs else -math.inf
+  high = kwargs['high'] if 'high' in kwargs else math.inf
+  if x < low:
+    return low
+  elif x > high:
+    return high
+  return x
+
+def interpolate(xs, i, adjust_i=True, linear_interpolation=True):
+  if adjust_i and linear_interpolation:
+    i = i * (len(xs) - 1) / len(xs)
+  i_int = int(i)
+  i_diff = i - int(i)
+  if i_diff == 0:
+    return xs[i_int]
+  if linear_interpolation:
+    return (1 - i_diff) * xs[i_int] + i_diff * xs[i_int + 1]
+  else:
+    return xs[i_int]
+
+def scale_to_monotonic_function(x, monofunc, x_domain, monofunc_domain, target_range):
+  # We want monofunc to start at x=0 and end at x=1, and start at y=0 and end at y=1
+  monofunc_range = tuple(monofunc(v) for v in monofunc_domain)
+  monofunc_min, monofunc_max = monofunc_range
+  def monofunc_norm(x):
+    return monofunc(scale_to_relative_domain(x, x_domain, monofunc_domain))
+  return scale_to_relative_domain(monofunc_norm(x), monofunc_range, target_range)
+
+def scale_to_relative_domain(x, x_domain, target_domain):
+  x_min, x_max = x_domain
+  target_min, target_max = target_domain
+  return (x - x_min) * (target_max - target_min) / (x_max - x_min) + target_min
+
+def curry(f, curry_arg, n=0):
+  def curried(*args, **kwargs):
+    arguments = [arg for arg in args]
+    arguments = arguments[:n] + [curry_arg] + arguments[n:]
+    return f(*arguments, **kwargs)
+  return curried
+
+def curry_kwarg(f, curry_arg, key):
+  def curried(*args, **kwargs):
+    key_args = dict(kwargs)
+    key_args[key] = curry_arg
+    return f(*args, **key_args)
+  return curried
+
+def is_numeric(x):
+  return isinstance(x, numbers.Number)
+
+scale_to_log = curry(scale_to_monotonic_function, lambda x: math.log(x), 1)
+scale_to_exponential = curry(scale_to_monotonic_function, lambda x: 2 ** x, 1)
+
+def curry_multiple(f, curry_pairs=(), kwarg_curry_pairs={}):
+  curried = f
+  for curry_arg, n in curry_pairs:
+    curried = curry(curried, curry_arg, n)
+  for key, curry_arg in kwarg_curry_pairs.items():
+    curried = curry_kwarg(curried, curry_arg, key)
+  return curried
+
+
+def main():
+  default_duration = 10.0
+  argument_parser = argparse.ArgumentParser(prog='soundgraph', description='Translate a file with a bunch of numbers on '
+                      'different lines into a .wav sound file that works as an auditory graph.')
+  argument_parser.add_argument('data_file_in', metavar='{Data File In}',
+      help='The file with the data in it seperated into lines.')
+  argument_parser.add_argument('filename_out', metavar='{Destination .wav File}',
+      help='The name of the file we\'re gonna write the .wav-encoded sound to')
+  argument_parser.add_argument('--min-pitch', '-p', metavar='{Pitch (Hz)}', type=float,
+      help='The lowest output pitch (in Hz) that this program will generate (default is 200Hz if possible, but '
+           'if the max pitch is specified and lower than 400Hz, then this will default to half of '
+           'the maxmimum pitch.')
+  argument_parser.add_argument('--max-pitch', '-P', metavar='{Pitch (Hz)}', type=float,
+      help='The highest output pitch (in Hz; also, much like "--min-pitch"). If the minimum pitch is specified '
+           'and higher than 400Hz, then this will default to twice that.')
+  argument_parser.add_argument('--duration', '-d', metavar='{Time (seconds)}', type=float, default=default_duration,
+      help='The total duration of the final .wav file. Defaults to %s seconds. If the duration specified is '
+           'negative, then its negative represents the amount of time per data sample from our data file'
+           '.' % default_duration)
+  argument_parser.add_argument('--cumulative-mode', '--cumulative', '--cum', '-c', action='store_true',
+      help='Cumulative mode is used when the data is cumulative, and one wants the pitch to correspond '
+           'to the differences between the entries. In essence, this means that the running total, as '
+           'stored in the file, will be proportional in some way to the total number of oscillations '
+           'in the file.')
+  argument_parser.add_argument('--discard-first-line', '--discard-first', '-1', action='store_true',
+      help='Get rid of the first line in the file. This is useful when the data is labeled at the top.')
+  argument_parser.add_argument('--interpolation', '--interp', '-i', type=str, default='linear',
+      help='The method by which the input data will be interpolated. It defaults to linear interpolation, '
+           'but one may also choose "step", which has abrupt/immediate changes from entry to entry.')
+  argument_parser.add_argument('--use-linear-pitch', '--log', '-l', action='store_true',
+      help='Normally, the program corrects the pitch generated so that it will sound linear to human ears. '
+           'In case this correction is not needed, this option can be specified. This option is recommended '
+           'especially in the case that "--cumulative-mode" is specified and the desired output is a sound '
+           'file where the total number of oscillations corresponds to the cumulative total.')
+  argument_parser.add_argument('--frame-rate', '-r', type=int, default=44100,
+      help='The frame rate for our output .wav file. Defaults to 44100.')
+  argument_parser.add_argument('--quiet', '-q', action='store_true',
+      help='If this is specified, then the program won\'t output anything until it\'s completed its execution.')
+  argument_parser.add_argument('--alert-period', '-a', type=float, default=15.0,
+      help='For larger files, the program defaults to printing a status message showing percent '
+           'completion, time elapsed, and expected duration. Default value is 15 seconds.')
+  argument_parser.add_argument('--version', '-v', action='version', version='%(prog)s 0.1')
+  clargs = argument_parser.parse_args()
+  def printer(*args, **kwargs):
+    if clargs.quiet:
+      return
+    print(*args, **kwargs)
+  if clargs.min_pitch == None:
+    if clargs.max_pitch != None and clargs.max_pitch < 400:
+      clargs.min_pitch = clargs.max_pitch * 0.5
+    else:
+      clargs.min_pitch = 200
+  if clargs.max_pitch == None:
+    if clargs.min_pitch != None and clargs.min_pitch < 400:
+      clargs.max_pitch = clargs.min_pitch * 2
+    else:
+      clargs.max_pitch = 800
+  data_file_in = clargs.data_file_in
+  filename_out = clargs.filename_out
+  data_in = []
+  with open(clargs.data_file_in) as csvfile:
+    read_csv = csv.reader(csvfile, delimiter=',')
+    for row in all_but_first(read_csv) if clargs.discard_first_line else read_csv:
+      data_in.append(float(row[0]))
+  if clargs.cumulative_mode:
+    data_in = [b - a for a, b in zip(data_in, all_but_first(data_in))]
+  printer("Interpreting %d frames." % len(data_in))
+  with wave.open(filename_out, 'wb') as wave_write:
+    n_channels = 2
+    min_data_in = min(data_in)
+    max_data_in = max(data_in)
+    frame_rate = clargs.frame_rate
+    wave_write.setnchannels(n_channels)
+    wave_write.setsampwidth(2)
+    wave_write.setframerate(frame_rate)
+    duration = clargs.duration if clargs.duration > 0 else -clargs.duration * len(data_in)
+    printer("File will be %s seconds long." % (duration,))
+    data = [0] * int(frame_rate * duration * n_channels)
+    virtual_time = 0
+    n_frames = int(duration * frame_rate)
+    min_pitch = clargs.min_pitch
+    max_pitch = clargs.max_pitch
+    cutoff_pitch = frame_rate / 2
+    step_interpolation = clargs.interpolation == 'step'
+    printer('Pitch between %s and %s.' % (min_pitch, max_pitch))
+    printer('Data between %s and %s.' % (min_data_in, max_data_in))
+    if clargs.use_linear_pitch:
+      printer('Using linear pitch rather than logarithmic correction.')
+    start_time = time.time()
+    alert_counter = 0
+    for i in range(n_frames):
+      elapsed = time.time() - start_time
+      periods_so_far = int(elapsed / clargs.alert_period)
+      estimated_time_remaining = 0 if i == 0 else elapsed * (n_frames / i - 1)
+      if periods_so_far > alert_counter:
+        printer('On frame {0}/{1} ({2: 2.3f}% done; {3:.2f} seconds elapsed; {4:.2f} seconds estimated remaining)'.format(i + 1, n_frames, 100.0 * i / n_frames, elapsed, estimated_time_remaining))
+        alert_counter = periods_so_far
+      j = len(data_in) * i / n_frames
+      sample = interpolate(data_in, j, True, not step_interpolation)
+      seconds = 2 * i/frame_rate
+      pitch = min_pitch + (max_pitch - min_pitch) * (sample - min_data_in) / (max_data_in - min_data_in)
+      pitch = cutoff(pitch, high=cutoff_pitch)
+      if not clargs.use_linear_pitch:
+        pitch = scale_to_log(pitch, (min_pitch, max_pitch), (1, 2), (min_pitch, max_pitch))
+      d_time = 4/frame_rate
+      virtual_time += pitch * d_time
+      data[2*i] = 0.75 * math.cos(virtual_time) ** 15 + 0.25 * math.cos(virtual_time)
+      data[2*i+1] = 0.75 * math.cos(virtual_time) ** 15 + 0.25 * math.cos(virtual_time)
+    data_in_bytes = b''.join(wordify(word, True) for word in data)
+    wave_write.writeframes(data_in_bytes)
+
+
+if __name__ == '__main__':
+  main()
