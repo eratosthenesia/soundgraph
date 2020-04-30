@@ -163,7 +163,7 @@ def main():
     else:
       clargs.min_pitch = 200
   if clargs.max_pitch == None:
-    if clargs.min_pitch != None and clargs.min_pitch < 400:
+    if clargs.min_pitch != None and clargs.min_pitch > 400:
       clargs.max_pitch = clargs.min_pitch * 2
     else:
       clargs.max_pitch = 800
